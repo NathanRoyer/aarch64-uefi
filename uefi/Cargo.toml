@@ -1,0 +1,15 @@
+[package]
+name = "uefi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "*"
+uefi = { version = "0.16.1", features = [ "alloc", "exts", "logger" ] }
+psci = { version = "0.1.0", default-features = false, features = [ "hvc" ] }
+cortex-a = "7.5.0"
+tock-registers = "0.7.0"
+uefi-services = "0.13.1"
+pl011_qemu = { path = "../../pl011_qemu" }
+platform = { path = "../../platform" }
+numtoa = "0.2.4"
