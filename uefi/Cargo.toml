@@ -10,6 +10,5 @@ psci = { version = "0.1.0", default-features = false, features = [ "hvc" ] }
 cortex-a = "7.5.0"
 tock-registers = "0.7.0"
 uefi-services = "0.13.1"
-pl011_qemu = { path = "../../pl011_qemu" }
-platform = { path = "../../platform" }
+pl011_qemu = { git = "https://github.com/theseus-os/pl011/", branch = "aarch64-qemu-virt-test" }
 numtoa = "0.2.4"
