@@ -67,18 +67,6 @@ impl TableIndex {
     }
 }
 
-fn required_4_level_page_tables(l1_entries: usize) -> [usize; 4] {
-    let mut tables = [1; 4];
-
-    tables[3] = (l1_entries + 511) / 512;
-    let l2_descriptors = tables[3];
-    tables[2] = (l2_descriptors + 511) / 512;
-    let l3_descriptors = tables[2];
-    tables[1] = (l3_descriptors + 511) / 512;
-
-    tables
-}
-
 fn table_descriptor(addr: u64) -> u64 {
     addr | 0b01
 }
@@ -108,8 +96,6 @@ pub struct Aarch64MemoryManager {
     free: Box<[(u64, u64)]>,
     active: bool,
 }
-
-const RAM_BASE: u64 = 0xf;
 
 impl Aarch64MemoryManager {
     pub fn new() -> Self {

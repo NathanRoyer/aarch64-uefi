@@ -120,8 +120,7 @@ fn main(
 
     let _ = logger.write_str("\r\nActivating new memory map...\r\n");
 
-    let free_regions = free_regions.into_boxed_slice();
-    mmgr.set_free_regions(free_regions);
+    mmgr.set_free_regions(free_regions.into_boxed_slice());
     mmgr.activate();
 
     memory::enable_mmu();
@@ -150,6 +149,7 @@ fn main(
             online_cores += 1;
         }
     }
+
     let _ = logger.write_str("Online cores: ");
     let _ = logger.write_str(num_to_str(&mut [0u8; 30], online_cores, 10));
     let _ = logger.write_str("\r\n");
