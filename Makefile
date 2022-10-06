@@ -27,9 +27,7 @@ run: build
 	qemu-system-aarch64 $(QEMU_FLAGS)
 		
 debug: build
-	qemu-system-aarch64 $(QEMU_FLAGS) \
-		-monitor telnet:localhost:1235,server,nowait \
-		-gdb tcp::1236
+	qemu-system-aarch64 $(QEMU_FLAGS) -s
 
 clean:
 	rm -rf $(PWD)/build
