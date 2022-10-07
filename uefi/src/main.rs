@@ -26,11 +26,9 @@ use uefi::Status;
 use uefi::Handle;
 use uefi::table::SystemTable;
 use uefi::table::Boot;
-use uefi::table::boot::MemoryDescriptor;
 use uefi::table::boot::MemoryType;
 
 use memory::Aarch64MemoryManager;
-use memory::PAGE_SIZE;
 
 use numtoa::NumToA;
 
@@ -76,13 +74,8 @@ fn main(
 
     let mut logger = PL011::new(UART1::take().unwrap());
 
-    let _ = logger.write_str("Disabling MMU...\r\n");
-
-    memory::disable_mmu();
-
     let _ = logger.write_str("Discovering memory layout...\r\n");
 
-    // let (_, layout) = bootsvc.memory_map(&mut mmap).unwrap();
     for descriptor in layout {
         if descriptor.ty == MemoryType::CONVENTIONAL {
             free_regions.push((descriptor.phys_start, descriptor.page_count));
@@ -91,21 +84,13 @@ fn main(
         }
     }
 
-    let mut alloc_page = || {
-        for (addr, count) in free_regions.iter_mut() {
-            if *count > 0 {
-                *count -= 1;
-                let backup = *addr;
-                *addr += PAGE_SIZE as u64;
-                return backup;
-            }
-        }
-        panic!("Out of memory!");
-    };
+    let _ = logger.write_str("Creating memory manager...\r\n");
 
-    let mut mmgr = Aarch64MemoryManager::new();
+    let mut mmgr = Aarch64MemoryManager::new(&free_regions);
 
-    let _ = logger.write_str("Creating memory map...\r\n");
+    let _ = logger.write_str("Disabling MMU...\r\n");
+
+    mmgr.disable_mmu();
 
     for descriptor in &mapped_regions {
         let count = descriptor.page_count as usize;
@@ -113,25 +98,49 @@ fn main(
         // we're in id mapping: phys and virt are eq.
         let virt_addr = descriptor.phys_start;
         let phys_addr = descriptor.phys_start;
-        mmgr.map(virt_addr, phys_addr, &mut alloc_page, count);
+        mmgr.map(virt_addr, phys_addr, count);
     }
 
     // id-map the logger
-    mmgr.map(0x0900_0000, 0x0900_0000, &mut alloc_page, 1);
-
-    /* interrupts::setup();
-
-    log::info!("going in");
-    unsafe { asm!("svc #18") }; */
+    mmgr.map(0x0900_0000, 0x0900_0000, 1);
 
     let _ = logger.write_str("Configuring address translation...\r\n");
 
-    // mmgr.set_free_regions(free_regions.into_boxed_slice());
     mmgr.configure();
 
     let _ = logger.write_str("Activating new memory map...\r\n");
 
-    memory::enable_mmu();
+    mmgr.enable_mmu();
+
+    let _ = logger.write_str("Trying to read and write from shared memory...\r\n");
+
+    let free_page = mmgr.get_free_page(true);
+    let write_ptr = 0x100_000;
+    let read_ptr = 0x200_000;
+    mmgr.map(write_ptr, free_page, 1);
+    mmgr.map(read_ptr, free_page, 1);
+
+    let value = 55;
+
+    let write_ref = unsafe { (write_ptr as *mut [u8; 4096]).as_mut().unwrap() };
+    write_ref[99] = value;
+
+    let read_ref = unsafe { (read_ptr as *mut [u8; 4096]).as_mut().unwrap() };
+
+    assert_eq!(value, read_ref[99]);
+
+    mmgr.unmap_page(write_ptr, false);
+    mmgr.unmap_page(read_ptr, true);
+
+    /*
+    let _ = logger.write_str("Setting up interrupts...\r\n");
+
+    interrupts::setup();
+
+    let _ = logger.write_str("Triggering an interrupt...\r\n");
+
+    unsafe { asm!("svc #18") };
+    */
 
     let _ = logger.write_str("Starting cores...\r\n");
     let mut online_cores = 1;

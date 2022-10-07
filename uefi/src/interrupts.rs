@@ -1,5 +1,4 @@
 use core::arch::global_asm;
-use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::fmt;
 

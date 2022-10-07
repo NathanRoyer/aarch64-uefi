@@ -1,16 +1,9 @@
-use alloc::boxed::Box;
-use alloc::vec;
+use core::mem::size_of;
 
 use cortex_a::asm::barrier;
 use cortex_a::registers::*;
 use tock_registers::interfaces::Writeable;
-use tock_registers::interfaces::Readable;
 use tock_registers::interfaces::ReadWriteable;
-
-/*use platform::MappingOptions;
-use platform::Memory;
-use platform::Mapping;
-use platform::MemoryManager;*/
 
 pub const PAGE_BITS: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_BITS;
@@ -49,52 +42,62 @@ fn decode_address(virt_addr: u64) -> (u64, u64, u64, u64, u64) {
     (l0, l1, l2, l3, offset)
 }
 
-enum TableIndex {
-    Level0,
-    Level1(u64),
-    Level2(u64, u64),
-    Level3(u64, u64, u64),
+pub enum TableIndex {
+    Level0(u64),
+    Level1(u64, u64),
+    Level2(u64, u64, u64),
+    Level3(u64, u64, u64, u64),
 }
 
 impl TableIndex {
     /// only works under recursive paging
-    pub fn virtual_address(self, offset: u64) -> u64 {
+    pub fn virt_addr(self) -> u64 {
+        let u64sz = size_of::<u64>() as u64;
         match self {
-            TableIndex::Level0 => encode_address(NINE_1, NINE_1, NINE_1, NINE_1, offset),
-            TableIndex::Level1(l0) => encode_address(NINE_1, NINE_1, NINE_1, l0, offset),
-            TableIndex::Level2(l0, l1) => encode_address(NINE_1, NINE_1, l0, l1, offset),
-            TableIndex::Level3(l0, l1, l2) => encode_address(NINE_1, l0, l1, l2, offset),
+            TableIndex::Level0(slot) => encode_address(NINE_1, NINE_1, NINE_1, NINE_1, slot * u64sz),
+            TableIndex::Level1(l0, slot) => encode_address(NINE_1, NINE_1, NINE_1, l0, slot * u64sz),
+            TableIndex::Level2(l0, l1, slot) => encode_address(NINE_1, NINE_1, l0, l1, slot * u64sz),
+            TableIndex::Level3(l0, l1, l2, slot) => encode_address(NINE_1, l0, l1, l2, slot * u64sz),
         }
     }
 }
 
+const VALID_ENTRY_FLAG: u64 = 1 <<  0;
+const NOT_A_BLOCK_FLAG: u64 = 1 <<  1;
+const    ACCESSED_FLAG: u64 = 1 << 10;
+
 fn table_descriptor(addr: u64) -> u64 {
     assert_eq!(addr & !PAGE_ADDRESS_MASK, 0);
-    addr | 0b11
+
+    addr | VALID_ENTRY_FLAG | NOT_A_BLOCK_FLAG | ACCESSED_FLAG
 }
 
 // makes writeable, executable page entries
-fn block_descriptor(addr: u64) -> u64 {
+fn page_descriptor(addr: u64) -> u64 {
     assert_eq!(addr & !PAGE_ADDRESS_MASK, 0);
-    addr | 0b11 | (1 << 10)
+
+    addr | VALID_ENTRY_FLAG | NOT_A_BLOCK_FLAG | ACCESSED_FLAG
 }
 
 fn slot_available(slot: u64) -> bool {
-    (slot & 0b1) == 0
+    (slot & VALID_ENTRY_FLAG) == 0
 }
 
-pub fn disable_mmu() {
+fn disable_mmu() {
     SCTLR_EL1.modify(SCTLR_EL1::M::Disable);
     unsafe { barrier::isb(barrier::SY) };
 }
 
-pub fn enable_mmu() {
+fn enable_mmu() {
     SCTLR_EL1.modify(SCTLR_EL1::M::Enable);
     unsafe { barrier::isb(barrier::SY) };
-    unsafe { core::arch::asm!("mov x1, #0xbeef") };
 }
 
-pub fn debug_table(addr: *mut u64, level: usize) {
+// the logger used by this function
+// is set up by UEFI and is no longer
+// usable once boot services have been
+// exited
+fn _debug_table(addr: *mut u64, level: usize) {
     for i in 0..TABLE_SIZE {
         unsafe {
             let slot = addr.add(i).as_mut().unwrap();
@@ -105,7 +108,7 @@ pub fn debug_table(addr: *mut u64, level: usize) {
                 } else {
                     let prefix = &"            "[..(4 * level)];
                     log::info!("{}{} => table: 0x{:x}", prefix, i, next as u64);
-                    debug_table(next, level + 1);
+                    _debug_table(next, level + 1);
                 }
             }
         }
@@ -126,85 +129,177 @@ pub struct Aarch64MemoryManager {
     // page is freed, we store the value of
     // this field at the beginning of the page,
     // and the field is set to point to that page.
-    next_free_page_addr: u64,
+    next_free_page_pa: u64,
 
     active: bool,
 }
 
 impl Aarch64MemoryManager {
-    pub fn new() -> Self {
-        Self {
-            l0_table: 0usize as *mut u64,
-            next_free_page_addr: 0,
-            active: false,
-        }
-    }
-
-    /// Don't use this after boot services
-    /// have been exited
+    /// An object which manages a memory map
     ///
-    /// Because it uses the UEFI logger, which
-    /// is unusable after boot services have been exited
-    pub fn debug(&self) {
-        debug_table(self.l0_table, 0);
-    }
-
-    /// MMU must be disabled!
-    pub fn set_free_regions(&mut self, free: Box<[(u64, u64)]>) {
-        assert_eq!(self.next_free_page_addr, 0);
+    /// Note: Identity mapping must be active
+    /// or mmu must be disabled when you call
+    /// this constructor
+    pub fn new(free: &[(u64, u64)]) -> Self {
         let mut next = 0;
         for (mut address, size) in free.iter() {
             for _ in 0..*size {
-                unsafe {
-                    let ptr = address as *mut u64;
-                    *ptr = next;
-                }
+                let page_beginning = address as *mut u64;
+                unsafe { *page_beginning = next };
                 next = address;
                 address += PAGE_SIZE as u64;
             }
         }
-        self.next_free_page_addr = next;
+
+        let mut this = Self {
+            l0_table: 0usize as *mut u64,
+            next_free_page_pa: next,
+            active: false,
+        };
+
+        let emergency_l3 = this.get_free_page(true) as *mut u64;
+        let emergency_l2 = this.get_free_page(true) as *mut u64;
+        let emergency_l1 = this.get_free_page(true) as *mut u64;
+
+        this.l0_table = this.get_free_page(true) as *mut u64;
+        unsafe {
+            *emergency_l2 = table_descriptor(emergency_l3 as u64);
+            *emergency_l1 = table_descriptor(emergency_l2 as u64);
+            *this.l0_table = table_descriptor(emergency_l1 as u64);
+
+            // recursive paging
+            let last_entry = this.l0_table.add(511).as_mut().unwrap();
+            *last_entry = table_descriptor(this.l0_table as u64);
+        }
+
+        this
     }
 
-    pub fn map<F>(
-        &mut self,
-        mut virt_addr: u64,
-        mut phys_addr: u64,
-        mut alloc_page: F,
-        pages: usize
-    )
-        where F: FnMut() -> u64
-    {
-        assert!(!self.active);
+    pub fn disable_mmu(&mut self) {
+        disable_mmu();
+        self.active = false;
+    }
 
-        if self.l0_table.is_null() {
-            self.l0_table = alloc_page() as *mut u64;
-            unsafe {
-                self.l0_table.write_bytes(0, TABLE_SIZE);
-                // recursive paging
-                let last_entry = self.l0_table.add(511).as_mut().unwrap();
-                *last_entry = table_descriptor(self.l0_table as u64);
+    pub fn enable_mmu(&mut self) {
+        enable_mmu();
+        self.active = true;
+    }
+
+    // can only be used after recursive paging and
+    // emergency mapping have been setup (in constructor)
+    fn emergency_map(&mut self, phys_addr: Option<u64>) -> *mut u64 {
+        let emergency_l3_spot = TableIndex::Level3(0, 0, 0, 1).virt_addr() as *mut u64;
+
+        let descriptor = match phys_addr {
+            Some(phys_addr) => page_descriptor(phys_addr),
+            None => 0,
+        };
+
+        unsafe { *emergency_l3_spot = descriptor };
+        encode_address(0, 0, 0, 1, 0) as *mut u64
+    }
+
+    /// Selects a page from unused memory
+    /// and marks it as used
+    pub fn get_free_page(&mut self, zero: bool) -> u64 {
+        let address = self.next_free_page_pa;
+        assert_ne!(address, 0);
+
+        let page_beginning = if self.active {
+            self.emergency_map(Some(address))
+        } else {
+            address as *mut u64
+        };
+
+        unsafe {
+            self.next_free_page_pa = *page_beginning;
+
+            if zero {
+                page_beginning.write_bytes(0, TABLE_SIZE);
             }
         }
 
+        if self.active {
+            self.emergency_map(None);
+        }
+
+        address
+    }
+
+    /// Removes a page from the memory map
+    /// and (optionally) mark it as available
+    /// for future mappings
+    pub fn unmap_page(&mut self, virt_addr: u64, mark_free: bool) {
+        if mark_free {
+            let accessible = virt_addr as *mut u64;
+            unsafe { *accessible = self.next_free_page_pa };
+        }
+
+        let (l0, l1, l2, l3, offset) = decode_address(virt_addr);
+        assert_eq!(offset, 0);
+
+        let l3_slot_va = TableIndex::Level3(l0, l1, l2, l3).virt_addr() as *mut u64;
+        let l3_slot_ref = unsafe { l3_slot_va.as_mut().unwrap() };
+        assert!(!slot_available(*l3_slot_ref));
+
+        if mark_free {
+            let page_pa = *l3_slot_ref & PAGE_ADDRESS_MASK;
+            self.next_free_page_pa = page_pa;
+        }
+
+        *l3_slot_ref = 0;
+    }
+
+    /// Maps a range of pages, starting at specified addresses
+    pub fn map(&mut self, mut virt_addr: u64, mut phys_addr: u64, pages: usize) {
         for _ in 0..pages {
             let (l0, l1, l2, l3, offset) = decode_address(virt_addr);
             assert_eq!(offset, 0);
-            let mut ptr = self.l0_table;
-            unsafe {
-                for index in [l0, l1, l2] {
-                    let slot = ptr.add(index as usize).as_mut().unwrap();
-                    if slot_available(*slot) {
-                        let table = alloc_page() as *mut u64;
-                        table.write_bytes(0, TABLE_SIZE);
-                        *slot = table_descriptor(table as u64);
-                    }
-                    ptr = (*slot & PAGE_ADDRESS_MASK) as *mut u64;
+            // 0x1000 is the address for emergency mapping
+            assert_ne!(virt_addr, 0x1000);
+
+            if self.active {
+
+                let l0_slot_va = TableIndex::Level0(l0).virt_addr() as *mut u64;
+                if slot_available(unsafe { *l0_slot_va }) {
+                    let l1_table_pa = self.get_free_page(true);
+                    unsafe { *l0_slot_va = table_descriptor(l1_table_pa) };
                 }
 
-                let slot = ptr.add(l3 as usize).as_mut().unwrap();
-                assert!(slot_available(*slot));
-                *slot = block_descriptor(phys_addr);
+                let l1_slot_va = TableIndex::Level1(l0, l1).virt_addr() as *mut u64;
+                if slot_available(unsafe { *l1_slot_va }) {
+                    let l2_table_pa = self.get_free_page(true);
+                    unsafe { *l1_slot_va = table_descriptor(l2_table_pa) };
+                }
+
+                let l2_slot_va = TableIndex::Level2(l0, l1, l2).virt_addr() as *mut u64;
+                if slot_available(unsafe { *l2_slot_va }) {
+                    let l3_table_pa = self.get_free_page(true);
+                    unsafe { *l2_slot_va = table_descriptor(l3_table_pa) };
+                }
+
+                let l3_slot_va = TableIndex::Level3(l0, l1, l2, l3).virt_addr() as *mut u64;
+                let l3_slot_ref = unsafe { l3_slot_va.as_mut().unwrap() };
+                assert!(slot_available(*l3_slot_ref));
+                *l3_slot_ref = page_descriptor(phys_addr);
+
+            } else {
+                // assume we're under identity mapping
+                let mut ptr = self.l0_table;
+                unsafe {
+                    for index in [l0, l1, l2] {
+                        let slot = ptr.add(index as usize).as_mut().unwrap();
+                        if slot_available(*slot) {
+                            let table = self.get_free_page(true);
+                            *slot = table_descriptor(table);
+                        }
+                        ptr = (*slot & PAGE_ADDRESS_MASK) as *mut u64;
+                    }
+
+                    let slot = ptr.add(l3 as usize).as_mut().unwrap();
+                    assert!(slot_available(*slot));
+                    *slot = page_descriptor(phys_addr);
+                }
             }
 
             virt_addr += PAGE_SIZE as u64;
@@ -212,6 +307,9 @@ impl Aarch64MemoryManager {
         }
     }
 
+    /// Sets up various AARCH64 registers so that
+    /// this mapping will work as expected once you
+    /// enable the MMU
     pub fn configure(&mut self) {
         unsafe {
             MAIR_EL1.write(
